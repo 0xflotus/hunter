@@ -1,12 +1,15 @@
 use termion::event::Key;
+use pathbuftools::PathBufTools;
+use osstrtools::OsStrTools;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex, RwLock};
 use std::path::PathBuf;
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::collections::HashSet;
 
-use crate::files::{File, Files, PathBufExt};
+use crate::files::{File, Files};
 use crate::fscache::FsCache;
 use crate::listview::ListView;
 use crate::hbox::HBox;
@@ -226,7 +229,6 @@ impl Tabbable for TabView<FileBrowser> {
 
 impl FileBrowser {
     pub fn new(core: &WidgetCore, cache: Option<FsCache>) -> HResult<FileBrowser> {
-        let startup = cache.is_none();
         let fs_cache = cache.unwrap_or_else(|| FsCache::new(core.get_sender()));
 
         let cwd = std::env::current_dir().unwrap();
@@ -261,23 +263,19 @@ impl FileBrowser {
             let main_dir = File::new(&name,
                                      main_path.clone(),
                                      None);
-            let files = cache.get_files_sync(&main_dir)?;
+            let mut files = cache.get_files_sync(&main_dir)?;
             let selection = cache.get_selection(&main_dir).ok();
+
+            files.meta_all();
+
             let mut list = ListView::new(&core_m.clone(),
                                          files);
             if let Some(file) = selection {
                 list.select_file(&file);
             }
 
-            list.content.meta_all();
-            list.content.dirty_meta.set_dirty();
             list.refresh().log();
 
-            if startup {
-                list.animate_slide_up(None).log();
-            }
-
-            list.content.meta_all();
             Ok(list)
         }));
 
@@ -303,10 +301,6 @@ impl FileBrowser {
                 }
 
                 list.refresh().log();
-
-                if startup {
-                    list.animate_slide_up(None).log();
-                }
 
                 Ok(list)
             }));
@@ -402,11 +396,13 @@ impl FileBrowser {
 
         } else {
             self.core.get_sender().send(Events::InputEnabled(false))?;
+            self.core.screen.drop_screen();
 
             let status = std::process::Command::new("rifle")
                 .args(file.path.file_name())
                 .status();
 
+            self.core.screen.reset_screen().log();
             self.clear().log();
             self.core.screen.cursor_hide().log();
 
@@ -439,6 +435,19 @@ impl FileBrowser {
         };
 
         self.proc_view.lock()?.run_proc_raw(cmd)?;
+
+        Ok(())
+    }
+
+    pub fn main_widget_goto_wait(&mut self, dir :&File) -> HResult<()> {
+        self.main_widget_goto(&dir)?;
+
+        // replace this with on_ready_mut() later
+        let pause = std::time::Duration::from_millis(10);
+        while self.main_widget().is_err() {
+            self.main_async_widget_mut()?.refresh().log();
+            std::thread::sleep(pause);
+        }
 
         Ok(())
     }
@@ -831,6 +840,170 @@ impl FileBrowser {
         Ok(())
     }
 
+    fn external_select(&mut self) -> HResult<()> {
+        let shell = std::env::var("SHELL").unwrap_or("bash".into());
+        let cmd = self.core
+            .config.read()?
+            .get()?
+            .select_cmd
+            .clone();
+
+        self.core.get_sender().send(Events::InputEnabled(false))?;
+        self.core.screen.drop_screen();
+        self.preview_widget().map(|preview| preview.cancel_animation()).log();
+
+        let cmd_result = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output();
+
+        self.core.screen.reset_screen().log();
+        self.clear().log();
+        self.core.get_sender().send(Events::InputEnabled(true))?;
+
+        match cmd_result {
+            Ok(cmd_result) => {
+                if cmd_result.status.success() {
+                    let cwd = &self.cwd.path;
+
+                    let paths = OsString::from_vec(cmd_result.stdout)
+                        .split_lines()
+                        .iter()
+                        .map(|output| {
+                            let path = PathBuf::from(output);
+                            if path.is_absolute() {
+                                path
+                            } else {
+                                cwd.join(path)
+                            }
+                        })
+                        .collect::<Vec<PathBuf>>();
+
+                    if paths.len() == 1 {
+                        let path = &paths[0];
+                        if path.exists() {
+                            if path.is_dir() {
+                                let dir = File::new_from_path(&path, None)?;
+
+                                self.main_widget_goto(&dir).log();
+                            } else if path.is_file() {
+                                let file = File::new_from_path(&path, None)?;
+                                let dir = file.parent_as_file()?;
+
+                                self.main_widget_goto_wait(&dir).log();
+
+                                self.main_widget_mut()?.select_file(&file);
+                            }
+                        } else {
+                            let msg = format!("Can't access path: {}!",
+                                              path.to_string_lossy());
+                            self.show_status(&msg).log();
+                        }
+                    } else {
+                        let mut last_file = None;
+                        for file_path in paths {
+                            if !file_path.exists() {
+                                let msg = format!("Can't find: {}",
+                                                  file_path .to_string_lossy());
+                                self.show_status(&msg).log();
+                                continue;
+                            }
+
+                            let dir_path = file_path.parent()?;
+                            if self.cwd.path != dir_path {
+                                let file_dir = File::new_from_path(&dir_path, None);
+
+                                self.main_widget_goto_wait(&file_dir?).log();
+                            }
+
+                            self.main_widget_mut()?
+                                .content
+                                .find_file_with_path(&file_path)
+                                .map(|file| {
+                                    file.toggle_selection();
+                                    last_file = Some(file.clone());
+                                });
+                        }
+
+                        self.main_widget_mut().map(|w| {
+                            last_file.map(|f| w.select_file(&f));
+                            w.content.set_dirty();
+                        }).log();
+                    }
+                } else {
+                    self.show_status("External program failed!").log();
+                }
+            }
+            Err(_) => self.show_status("Can't run external program!").log()
+        }
+
+        Ok(())
+    }
+
+    fn external_cd(&mut self) -> HResult<()> {
+        let shell = std::env::var("SHELL").unwrap_or("bash".into());
+        let cmd = self.core
+            .config.read()?
+            .get()?
+            .cd_cmd
+            .clone();
+
+        self.core.get_sender().send(Events::InputEnabled(false))?;
+        self.core.screen.drop_screen();
+        self.preview_widget().map(|preview| preview.cancel_animation()).log();
+
+        let cmd_result = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output();
+
+        self.core.screen.reset_screen().log();
+        self.clear().log();
+        self.core.get_sender().send(Events::InputEnabled(true))?;
+
+        match cmd_result {
+            Ok(cmd_result) => {
+                if cmd_result.status.success() {
+                    let cwd = &self.cwd.path;
+
+                    let path_string = OsString::from_vec(cmd_result.stdout);
+                    let path_string = path_string.trim_end_newlines();
+                    let path = PathBuf::from(path_string);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    };
+
+                    if path.exists() {
+                        if path.is_dir() {
+                            let dir = File::new_from_path(&path, None)?;
+                            self.main_widget_goto(&dir).log();
+                        }
+                        else {
+                            let msg = format!("Can't access path: {}!",
+                                              path.to_string_lossy());
+                            self.show_status(&msg).log();
+                        }
+
+                    } else {
+                        self.show_status("External program failed!").log();
+                    }
+                }
+            }
+            Err(_) => self.show_status("Can't run external program!").log()
+        }
+
+        Ok(())
+    }
+
+
     fn exec_cmd(&mut self,
                 tab_dirs: Vec<File>,
                 tab_files: Vec<Vec<File>>) -> HResult<()> {
@@ -913,7 +1086,7 @@ impl FileBrowser {
         let xsize = self.get_coordinates()?.xsize();
         let ypos = self.get_coordinates()?.position().y();
         let pos = self.main_widget()?.get_selection();
-        let file = self.main_widget()?.content.files.get(pos)?;
+        let file = self.main_widget()?.content.get_files().get(pos).cloned()?;
 
         let permissions = file.pretty_print_permissions().unwrap_or("NOPERMS".into());
         let user = file.pretty_user().unwrap_or("NOUSER".into());
@@ -1037,16 +1210,19 @@ impl Widget for FileBrowser {
 
     fn on_key(&mut self, key: Key) -> HResult<()> {
         match key {
+            Key::Alt(' ') => self.external_select()?,
+            Key::Alt('/') => self.external_cd()?,
             Key::Char('/') => { self.turbo_cd()?; },
+            Key::Char('q') => HError::quit()?,
             Key::Char('Q') => { self.quit_with_dir()?; },
-            Key::Right | Key::Char('f') => { self.enter_dir()?; },
-            Key::Char('F') => { self.open_bg()?; },
-            Key::Left | Key::Char('b') => { self.go_back()?; },
+            Key::Right | Key::Char('l') => { self.enter_dir()?; },
+            Key::Char('L') => { self.open_bg()?; },
+            Key::Left | Key::Char('h') => { self.go_back()?; },
             Key::Char('-') => { self.goto_prev_cwd()?; },
             Key::Char('`') => { self.goto_bookmark()?; },
             Key::Char('m') => { self.add_bookmark()?; },
             Key::Char('w') => { self.show_procview()?; },
-            Key::Char('l') => self.show_log()?,
+            Key::Char('g') => self.show_log()?,
             Key::Char('z') => self.run_subshell()?,
             Key::Char('c') => self.toggle_colums(),
             _ => { self.main_widget_mut()?.on_key(key)?; },

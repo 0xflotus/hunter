@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::mpsc::Sender;
 use std::hash::{Hash, Hasher};
-use std::os::unix::ffi::{OsStringExt, OsStrExt};
-use std::ffi::{OsStr, OsString};
 
 use lscolors::LsColors;
 use tree_magic;
@@ -19,6 +17,8 @@ use chrono::TimeZone;
 use failure::Error;
 use notify::DebouncedEvent;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use alphanumeric_sort::compare_str;
+use pathbuftools::PathBufTools;
 
 use crate::fail::{HResult, HError, ErrorLog};
 use crate::dirty::{AsyncDirtyBit, DirtyBit, Dirtyable};
@@ -27,7 +27,7 @@ use crate::widget::Events;
 
 
 lazy_static! {
-    static ref COLORS: LsColors = LsColors::from_env().unwrap();
+    static ref COLORS: LsColors = LsColors::from_env().unwrap_or_default();
     static ref TAGS: RwLock<(bool, Vec<PathBuf>)> = RwLock::new((false, vec![]));
 }
 
@@ -266,23 +266,41 @@ impl Files {
         match self.sort {
             SortBy::Name => self
                 .files
-                .sort_by(|a, b| alphanumeric_sort::compare_str(&a.name, &b.name)),
+                .sort_by(|a, b| {
+                    compare_str(&a.name, &b.name)
+                }),
             SortBy::Size => {
                 self.meta_all_sync().log();
                 self.files.sort_by(|a, b| {
-                    if a.meta().unwrap().size() == b.meta().unwrap().size() {
-                        return alphanumeric_sort::compare_str(&b.name, &a.name);
+                    match (a.meta(), b.meta()) {
+                        (Ok(a_meta), Ok(b_meta)) => {
+                            if a_meta.size() == b_meta.size() {
+                                compare_str(&b.name, &a.name)
+                            } else {
+                                a_meta.size().cmp(&b_meta.size()).reverse()
+                            }
+
+                        }
+                        _ => return std::cmp::Ordering::Equal
                     }
-                    a.meta().unwrap().size().cmp(&b.meta().unwrap().size()).reverse()
+
+
                 });
             }
             SortBy::MTime => {
                 self.meta_all_sync().log();
                 self.files.sort_by(|a, b| {
-                    if a.meta().unwrap().mtime() == b.meta().unwrap().mtime() {
-                        return alphanumeric_sort::compare_str(&a.name, &b.name);
+                    match (a.meta(), b.meta()) {
+                        (Ok(a_meta), Ok(b_meta)) => {
+                            if a_meta.mtime() == b_meta.mtime() {
+                                compare_str(&b.name, &a.name)
+                            } else {
+                                a_meta.mtime().cmp(&b_meta.mtime()).reverse()
+                            }
+
+                        }
+                        _ => return std::cmp::Ordering::Equal
                     }
-                    a.meta().unwrap().mtime().cmp(&b.meta().unwrap().mtime())
                 });
             }
         };
@@ -323,7 +341,12 @@ impl Files {
     }
 
     pub fn toggle_hidden(&mut self) {
-        self.show_hidden = !self.show_hidden
+        self.show_hidden = !self.show_hidden;
+        self.set_dirty();
+
+        if self.show_hidden == true {
+            self.remove_placeholder();
+        }
     }
 
     pub fn replace_file(&mut self,
@@ -344,8 +367,23 @@ impl Files {
             new.selected = selected;
             self.files.push(new);
         });
+
         self.sort();
+
+        if self.len() == 0 {
+            let placeholder = File::new_placeholder(&self.directory.path)?;
+            self.files.push(placeholder);
+        } else {
+            self.remove_placeholder();
+        }
+
         Ok(())
+    }
+
+    fn remove_placeholder(&mut self) {
+        let dirpath = self.directory.path.clone();
+        self.find_file_with_path(&dirpath).cloned()
+            .map(|placeholder| self.files.remove_item(&placeholder));
     }
 
     pub fn handle_event(&mut self,
@@ -956,219 +994,5 @@ impl File {
 
     pub fn short_string(&self) -> String {
         self.path.short_string()
-    }
-}
-
-
-pub trait PathBufExt {
-    fn short_path(&self) -> PathBuf;
-    fn short_string(&self) -> String;
-    fn name_starts_with(&self, pat: &str) -> bool;
-    fn quoted_file_name(&self) -> Option<OsString>;
-    fn quoted_path(&self) -> OsString;
-}
-
-impl PathBufExt for PathBuf {
-    fn short_path(&self) -> PathBuf {
-        if let Ok(home) = crate::paths::home_path() {
-            if let Ok(short) = self.strip_prefix(home) {
-                let mut path = PathBuf::from("~");
-                path.push(short);
-                return path
-            }
-        }
-        return self.clone();
-    }
-
-    fn short_string(&self) -> String {
-        self.short_path().to_string_lossy().to_string()
-    }
-
-    fn name_starts_with(&self, pat: &str) -> bool {
-        if let Some(name) = self.file_name() {
-            let nbytes = name.as_bytes();
-            let pbytes = pat.as_bytes();
-
-            if nbytes.starts_with(pbytes) {
-                return true;
-            } else {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn quoted_file_name(&self) -> Option<OsString> {
-        if let Some(name) = self.file_name() {
-            let mut name = name.as_bytes().to_vec();
-            let mut quote = "\"".as_bytes().to_vec();
-            let mut quoted = vec![];
-            quoted.append(&mut quote.clone());
-            quoted.append(&mut name);
-            quoted.append(&mut quote);
-
-            let quoted_name = OsStr::from_bytes(&quoted).to_os_string();
-            return Some(quoted_name);
-        }
-        None
-    }
-
-    fn quoted_path(&self) -> OsString {
-        let mut path = self.clone().into_os_string().into_vec();
-        let mut quote = "\"".as_bytes().to_vec();
-
-        let mut quoted = vec![];
-        quoted.append(&mut quote.clone());
-        quoted.append(&mut path);
-        quoted.append(&mut quote);
-
-        OsString::from_vec(quoted)
-    }
-}
-
-pub trait OsStrTools {
-    fn split(&self, pat: &OsStr) -> Vec<OsString>;
-    fn replace(&self, from: &OsStr, to: &OsStr) -> OsString;
-    fn trim_last_space(&self) -> OsString;
-    fn contains_osstr(&self, pat: &OsStr) -> bool;
-    fn position(&self, pat: &OsStr) -> Option<usize>;
-    fn splice_quoted(&self, from: &OsStr, to: Vec<OsString>) -> Vec<OsString>;
-    fn splice_with(&self, from: &OsStr, to: Vec<OsString>) -> Vec<OsString>;
-    fn quote(&self) -> OsString;
-}
-
-impl OsStrTools for OsStr {
-    fn split(&self, pat: &OsStr) -> Vec<OsString> {
-        let orig_string = self.as_bytes().to_vec();
-        let pat = pat.as_bytes().to_vec();
-        let pat_len = pat.len();
-
-        let split_string = orig_string
-            .windows(pat_len)
-            .enumerate()
-            .fold(Vec::new(), |mut split_pos, (i, chars)| {
-                if chars == pat.as_slice() {
-                    if split_pos.len() == 0 {
-                        split_pos.push((0, i));
-                    } else {
-                        let len = split_pos.len();
-                        let last_split = split_pos[len-1].1;
-                        split_pos.push((last_split, i));
-                    }
-                }
-                split_pos
-            }).iter()
-            .map(|(start, end)| {
-                OsString::from_vec(orig_string[*start..*end]
-                                   .to_vec()).replace(&OsString::from_vec(pat.clone()),
-                                                      &OsString::from(""))
-            }).collect();
-        split_string
-    }
-
-
-    fn quote(&self) -> OsString {
-        let mut string = self.as_bytes().to_vec();
-        let mut quote = "\"".as_bytes().to_vec();
-
-        let mut quoted = vec![];
-        quoted.append(&mut quote.clone());
-        quoted.append(&mut string);
-        quoted.append(&mut quote);
-
-        OsString::from_vec(quoted)
-    }
-
-    fn splice_quoted(&self, from: &OsStr, to: Vec<OsString>) -> Vec<OsString> {
-        let quoted_to = to.iter()
-            .map(|to| to.quote())
-            .collect();
-        self.splice_with(from, quoted_to)
-    }
-
-    fn splice_with(&self, from: &OsStr, to: Vec<OsString>) -> Vec<OsString> {
-        let pos = self.position(from);
-
-        if pos.is_none() {
-            return vec![OsString::from(self)];
-        }
-
-        let pos = pos.unwrap();
-        let string = self.as_bytes().to_vec();
-        let from = from.as_bytes().to_vec();
-        let fromlen = from.len();
-
-        let lpart = OsString::from_vec(string[0..pos].to_vec());
-        let rpart = OsString::from_vec(string[pos+fromlen..].to_vec());
-
-        let mut result = vec![
-            vec![lpart.trim_last_space()],
-            to,
-            vec![rpart]
-        ].into_iter()
-            .flatten()
-            .filter(|part| part.len() != 0)
-            .collect::<Vec<OsString>>();
-
-        if result.last() == Some(&OsString::from("")) {
-            result.pop();
-            result
-        } else { result }
-    }
-
-    fn replace(&self, from: &OsStr, to: &OsStr) -> OsString {
-        let orig_string = self.as_bytes().to_vec();
-        let from = from.as_bytes();
-        let to = to.as_bytes().to_vec();
-        let from_len = from.len();
-
-        let new_string = orig_string
-            .windows(from_len)
-            .enumerate()
-            .fold(Vec::new(), |mut pos, (i, chars)| {
-                if chars == from {
-                    pos.push(i);
-                }
-                pos
-            }).iter().rev().fold(orig_string.to_vec(), |mut string, pos| {
-                let pos = *pos;
-                string.splice(pos..pos+from_len, to.clone());
-                string
-            });
-
-        OsString::from_vec(new_string)
-    }
-
-    fn trim_last_space(&self) -> OsString {
-        let string = self.as_bytes();
-        let len = string.len();
-
-        if len > 0 {
-            OsString::from_vec(string[..len-1].to_vec())
-        } else {
-            self.to_os_string()
-        }
-    }
-
-    fn contains_osstr(&self, pat: &OsStr) -> bool {
-        let string = self.as_bytes();
-        let pat = pat.as_bytes();
-        let pat_len = pat.len();
-
-        string.windows(pat_len)
-            .find(|chars|
-                  chars == &pat
-            ).is_some()
-    }
-
-    fn position(&self, pat: &OsStr) -> Option<usize> {
-        let string = self.as_bytes();
-        let pat = pat.as_bytes();
-        let pat_len = pat.len();
-
-        string.windows(pat_len)
-            .position(|chars|
-                      chars == pat
-            )
     }
 }

@@ -150,7 +150,6 @@ pub trait Widget {
     fn on_event(&mut self, event: Event) -> HResult<()> {
         self.clear_status().log();
         match event {
-            Event::Key(Key::Char('q')) => HError::quit(),
             Event::Key(key) => self.on_key(key),
             Event::Mouse(button) => self.on_mouse(button),
             Event::Unsupported(wtf) => self.on_wtf(wtf),
@@ -509,9 +508,9 @@ fn dispatch_events(tx_internal: Sender<Events>,
                 _ => {}
             }
             if let Some(tx_exclusive) =  &tx_exclusive_event {
-                tx_exclusive.send(event).unwrap();
+                tx_exclusive.send(event).ok();
             } else {
-                tx_internal.send(event).unwrap();
+                tx_internal.send(event).ok();
             }
         }
     });

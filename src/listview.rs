@@ -35,6 +35,12 @@ impl Listable for ListView<Files> {
     }
 
     fn on_refresh(&mut self) -> HResult<()> {
+        if self.content.len() == 0 {
+            let path = &self.content.directory.path;
+            let placeholder = File::new_placeholder(&path)?;
+            self.content.files.push(placeholder);
+        }
+
         let sender = self.core.get_sender();
 
         let visible_files = self.core.coordinates.size_u().1 + self.offset + 1;
@@ -55,13 +61,13 @@ impl Listable for ListView<Files> {
 
     fn on_key(&mut self, key: Key) -> HResult<()> {
         match key {
-            Key::Up | Key::Char('p') => {
+            Key::Up | Key::Char('k') => {
                 self.move_up();
                 self.refresh()?;
             }
-            Key::Char('P') => { for _ in 0..10 { self.move_up() } self.refresh()?; }
-            Key::Char('N') => { for _ in 0..10 { self.move_down() } self.refresh()?; }
-            Key::Down | Key::Char('n') => {
+            Key::Char('K') => { for _ in 0..10 { self.move_up() } self.refresh()?; }
+            Key::Char('J') => { for _ in 0..10 { self.move_down() } self.refresh()?; }
+            Key::Down | Key::Char('j') => {
                 self.move_down();
                 self.refresh()?;
             },
@@ -76,11 +82,11 @@ impl Listable for ListView<Files> {
             Key::Char(' ') => self.multi_select_file(),
             Key::Char('v') => self.invert_selection(),
             Key::Char('t') => self.toggle_tag()?,
-            Key::Char('h') => self.toggle_hidden(),
+            Key::Char('H') => self.toggle_hidden(),
             Key::Char('r') => self.reverse_sort(),
             Key::Char('s') => self.cycle_sort(),
-            Key::Char('K') => self.select_next_mtime(),
-            Key::Char('k') => self.select_prev_mtime(),
+            Key::Char('N') => self.select_next_mtime(),
+            Key::Char('n') => self.select_prev_mtime(),
             Key::Char('d') => self.toggle_dirs_first(),
             _ => { self.bad(Event::Key(key))?; }
         }
@@ -439,6 +445,11 @@ impl ListView<Files>
         self.show_status(&format!("Filtering with: \"{}\"", msgstr)).log();
 
         self.content.set_filter(filter);
+
+        if self.content.len() == 0 {
+            self.show_status("No files like that! Resetting filter").log();
+            self.content.set_filter(Some("".to_string()));
+        }
 
         if self.get_selection() > self.len() {
             self.set_selection(self.len());

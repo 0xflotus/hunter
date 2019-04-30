@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStringExt;
 
 use termion::event::Key;
 use unicode_width::UnicodeWidthStr;
+use osstrtools::OsStrTools;
 
 use crate::listview::{Listable, ListView};
 use crate::textview::TextView;
@@ -18,7 +19,7 @@ use crate::dirty::Dirtyable;
 use crate::hbox::HBox;
 use crate::fail::{HResult, HError, ErrorLog};
 use crate::term;
-use crate::files::{File, OsStrTools};
+use crate::files::File;
 
 #[derive(Debug)]
 struct Process {
@@ -562,16 +563,16 @@ impl Widget for ProcView {
                 self.clear().log();
                 return Err(HError::PopupFinnished) }
             Key::Char('d') => { self.remove_proc()? }
-            Key::Char('k') => { self.get_listview_mut().kill_proc()? }
-            Key::Up | Key::Char('p') => {
+            Key::Char('K') => { self.get_listview_mut().kill_proc()? }
+            Key::Up | Key::Char('k') => {
                 self.get_listview_mut().move_up();
             }
-            Key::Down | Key::Char('n') => {
+            Key::Down | Key::Char('j') => {
                 self.get_listview_mut().move_down();
             }
             Key::Char('f') => { self.toggle_follow().log(); }
-            Key::Ctrl('n') => { self.scroll_down().log(); },
-            Key::Ctrl('p') => { self.scroll_up().log(); },
+            Key::Ctrl('j') => { self.scroll_down().log(); },
+            Key::Ctrl('k') => { self.scroll_up().log(); },
             Key::Ctrl('v') => { self.page_down().log(); },
             Key::Alt('v') => { self.page_up().log(); },
             Key::Char('>') => { self.scroll_bottom().log(); },
